@@ -1,0 +1,7 @@
+*.pt
+train_data.json
+val_data.json
+training_stats.json
+__pycache__/
+.ipynb_checkpoints/
+calc_epoch.py

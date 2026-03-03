@@ -1,0 +1,7 @@
+README.md
+mamba_scan.cpp
+setup.py
+mamba_scan.egg-info/PKG-INFO
+mamba_scan.egg-info/SOURCES.txt
+mamba_scan.egg-info/dependency_links.txt
+mamba_scan.egg-info/top_level.txt
