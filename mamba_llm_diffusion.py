@@ -53,8 +53,10 @@ class DiM_LLM(nn.Module):
 
         h = x
         for layer in self.layers:
+            # Inject time embedding at every layer (DiT-style per-layer conditioning)
             h = layer["norm"](h + t_emb)
             h = h + layer["mamba"](h)
+            t_emb = t_emb  # pass through (structured for future AdaLN upgrade)
             
         h = self.final_norm(h)
         return self.output_proj(h)
@@ -106,7 +108,8 @@ class MaskedDiffusionEngine:
         return loss
 
     @torch.no_grad()
-    def sample(self, n_samples=1, steps=32, prompt_ids=None, temperature=0.7):
+    def sample(self, n_samples=1, steps=32, prompt_ids=None, temperature=0.3):
+        # temperature=0.3: Conservative sampling to prevent high-entropy repetition loops
         # Use EMA model for sampling if available
         sampling_model = self.ema_model if self.ema_model is not None else self.model
         sampling_model.eval()

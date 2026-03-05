@@ -1,158 +1,185 @@
 import torch
 import torch.optim as optim
-import json
-import os
-import time
+import json, os, time, copy, random, glob
 from transformers import GPT2Tokenizer
 from mamba_llm_diffusion import DiM_LLM, MaskedDiffusionEngine, Config
 
-# System Upgrade: DiM-LLM v3 with GPT-2 BPE Tokenizer
+# DiM-LLM v3.2 - Fine Tune
+# FIX-1: Resume from epoch003 EMA (best checkpoint)
+# FIX-2: LR 3e-5 + CosineAnnealingLR
+# FIX-3: batch_size 4
+# FIX-4: DSR interleaving 1:3
+# FIX-5: Early stopping patience=3
+# FIX-6: Auto-save best model
+
+RESUME_CHECKPOINT = "dim_llm_ema_epoch003.pt"
+DSR_FILE          = "synthetic_dsr_data.json"
+DSR_RATIO         = 0.25
+BATCH_SIZE        = 2   # OOM at 4 with seq_len=256 on 12GB; back to safe value
+EPOCHS            = 40
+LR                = 3e-5
+EARLY_STOP_PAT    = 3
+SEQ_LEN           = 256
+
+
+def build_dsr_chunks(tokenizer, seq_len):
+    if not os.path.exists(DSR_FILE):
+        print("  [DSR] Not found - disabled.")
+        return []
+    with open(DSR_FILE, "r") as f:
+        dsr_list = json.load(f)
+    sep = " " + tokenizer.eos_token + " "
+    raw = sep.join(dsr_list)
+    ids = torch.tensor(tokenizer.encode(raw, add_special_tokens=False), dtype=torch.long)
+    chunks = [ids[i:i+seq_len] for i in range(0, len(ids)-seq_len, seq_len)]
+    random.shuffle(chunks)
+    print(f"  [DSR] {len(chunks)} chunks from {len(dsr_list)} examples.")
+    return chunks
+
 
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Training DiM-LLM v3 (Masked Diffusion + GPT-2) on {device}...")
-    
-    # 1. Initialize GPT-2 Tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    # Add explicit mask token
-    tokenizer.add_special_tokens({'mask_token': '[MASK]'})
-    
-    # 2. Load Dataset
-    if not os.path.exists("train_data.json"):
-        print("Error: train_data.json not found. Run generate_dataset.py first.")
-        return
+    print(f"DiM-LLM v3.2 Fine-Tune on {device}")
 
-    # Load raw text and concatenate for BPE chunking
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer.add_special_tokens({"mask_token": "[MASK]"})
+
     with open("train_data.json", "r") as f:
         train_list = json.load(f)
     with open("val_data.json", "r") as f:
         val_list = json.load(f)
-        
-    full_train_text = " <|endoftext|> ".join(train_list)
-    full_val_text = " <|endoftext|> ".join(val_list)
-    
-    # Encode entire stream
-    train_ids = torch.tensor(tokenizer.encode(full_train_text, add_special_tokens=False), dtype=torch.long)
-    val_ids = torch.tensor(tokenizer.encode(full_val_text, add_special_tokens=False), dtype=torch.long)
-    
-    # Model Setup
-    config = Config(
-        vocab_size=len(tokenizer), # 50258
-        d_model=1024,
-        n_layers=11,
-        seq_len=256
-    )
 
-    model = DiM_LLM(config).to(device)
-    
-    # EMA Model Initialization (Shadow Weights)
-    import copy
+    sep = " " + tokenizer.eos_token + " "
+    train_ids = torch.tensor(tokenizer.encode(sep.join(train_list), add_special_tokens=False), dtype=torch.long)
+    val_ids   = torch.tensor(tokenizer.encode(sep.join(val_list),   add_special_tokens=False), dtype=torch.long)
+    dsr_chunks = build_dsr_chunks(tokenizer, SEQ_LEN)
+
+    config = Config(vocab_size=len(tokenizer), d_model=1024, n_layers=11, seq_len=SEQ_LEN)
+    model     = DiM_LLM(config).to(device)
     ema_model = copy.deepcopy(model).to(device)
     for p in ema_model.parameters():
         p.requires_grad = False
-        
+
     engine = MaskedDiffusionEngine(model, config, device=device, ema_decay=0.999)
     engine.ema_model = ema_model
-    
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
+    if os.path.exists(RESUME_CHECKPOINT):
+        print(f"  -> Resuming from {RESUME_CHECKPOINT}")
+        state = torch.load(RESUME_CHECKPOINT, map_location=device)
+        model.load_state_dict(state)
+        ema_model.load_state_dict(state)
+    else:
+        print("  -> No checkpoint, starting fresh.")
 
-    # 3. Training Loop
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+    num_chunks = (len(train_ids) - 1) // SEQ_LEN
+    print(f"  -> {num_chunks} train chunks | batch={BATCH_SIZE} | lr={LR} | patience={EARLY_STOP_PAT}")
+
     stats = {"train_loss": [], "val_loss": [], "step": 0, "salads": [], "tps": 0}
-    
-    batch_size = 2 # Reduced batch size for 200M model and seq_len=256 on 12GB VRAM
-    epochs = 40
+    best_val = float("inf")
+    patience_counter = 0
 
-    
-    print(f"Starting training (Vocab: {config.vocab_size}, Params: {sum(p.numel() for p in model.parameters()):,})...")
-
-    for epoch in range(epochs):
-        epoch_loss = 0
+    for epoch in range(EPOCHS):
         model.train()
-        
-        # Chunking the stream into seq_len segments
-        num_chunks = (len(train_ids) - 1) // config.seq_len
+        epoch_loss = 0.0
         indices = list(range(num_chunks))
-        import random
         random.shuffle(indices)
-        
-        for i in range(0, num_chunks, batch_size):
-            start_time = time.time()
-            
-            # Create batch
-            batch_indices = indices[i:i+batch_size]
-            batch_tokens = []
-            for idx in batch_indices:
-                chunk = train_ids[idx * config.seq_len : (idx + 1) * config.seq_len]
-                batch_tokens.append(chunk)
-            
-            if not batch_tokens: continue
-            
-            batch_tokens = torch.stack(batch_tokens).to(device)
-            
-            # Masked Diffusion Train Step
+        dsr_cursor = 0
+
+        for i in range(0, num_chunks, BATCH_SIZE):
+            t0 = time.time()
+
+            if dsr_chunks and random.random() < DSR_RATIO:
+                batch_list = [dsr_chunks[(dsr_cursor + k) % len(dsr_chunks)] for k in range(BATCH_SIZE)]
+                dsr_cursor += BATCH_SIZE
+            else:
+                batch_indices = indices[i:i+BATCH_SIZE]
+                batch_list = [train_ids[idx*SEQ_LEN:(idx+1)*SEQ_LEN] for idx in batch_indices]
+
+            if not batch_list:
+                continue
+            batch_tokens = torch.stack(batch_list).to(device)
+
             optimizer.zero_grad()
             loss = engine.forward_process(batch_tokens)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
             engine.update_ema()
 
-            
-            end_time = time.time()
-            
-            # TPS
-            batch_tps = (batch_tokens.shape[0] * config.seq_len) / (end_time - start_time)
+            elapsed   = max(time.time() - t0, 1e-6)
+            batch_tps = (batch_tokens.shape[0] * SEQ_LEN) / elapsed
             stats["tps"] = 0.9 * stats.get("tps", batch_tps) + 0.1 * batch_tps
-            
-            epoch_loss += loss.item()
+            epoch_loss  += loss.item()
             stats["step"] += 1
 
             if stats["step"] % 25 == 0:
-                with open("training_stats.json", "w") as f:
-                    json.dump(stats, f)
-            
+                with open("training_stats.json", "w") as fj:
+                    json.dump(stats, fj)
+
+        scheduler.step()
+
         # Validation
         model.eval()
-        val_loss_accum = 0
-        num_val_chunks = (len(val_ids) - 1) // config.seq_len
+        val_accum     = 0.0
+        num_val_chunks = (len(val_ids) - 1) // SEQ_LEN
+        max_val        = min(num_val_chunks, 100)
         with torch.no_grad():
-            for v_idx in range(0, min(num_val_chunks, 20), batch_size): # Limit val steps for speed
-                v_batch = []
-                for j in range(v_idx, min(v_idx + batch_size, num_val_chunks)):
-                    v_batch.append(val_ids[j * config.seq_len : (j + 1) * config.seq_len])
-                if not v_batch: continue
-                v_batch = torch.stack(v_batch).to(device)
-                v_loss = engine.forward_process(v_batch)
-                val_loss_accum += v_loss.item()
+            for v in range(0, max_val, BATCH_SIZE):
+                vb = [val_ids[j*SEQ_LEN:(j+1)*SEQ_LEN] for j in range(v, min(v+BATCH_SIZE, num_val_chunks))]
+                if vb:
+                    val_accum += engine.forward_process(torch.stack(vb).to(device)).item()
 
-        avg_train = epoch_loss / max(1, (num_chunks/batch_size))
-        avg_val = val_loss_accum / max(1, (min(num_val_chunks, 20)/batch_size))
+        avg_train = epoch_loss / max(1, num_chunks // BATCH_SIZE)
+        avg_val   = val_accum  / max(1, max_val   // BATCH_SIZE)
         stats["train_loss"].append(avg_train)
         stats["val_loss"].append(avg_val)
-        
-        print(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train:.4f} - Val Loss: {avg_val:.4f} - TPS: {stats['tps']:.1f}")
-        # Save both main and EMA checkpoints
-        torch.save(model.state_dict(), "dim_llm_checkpoint.pt")
+        cur_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch+1}/{EPOCHS} | Train={avg_train:.4f} Val={avg_val:.4f} LR={cur_lr:.2e} TPS={stats['tps']:.1f}")
+
+        # Save rotating checkpoints
+        ckpt     = f"dim_llm_epoch{epoch+1:03d}.pt"
+        ema_ckpt = f"dim_llm_ema_epoch{epoch+1:03d}.pt"
+        torch.save(model.state_dict(),     ckpt)
+        torch.save(ema_model.state_dict(), ema_ckpt)
+        torch.save(model.state_dict(),     "dim_llm_checkpoint.pt")
         torch.save(ema_model.state_dict(), "dim_llm_ema_checkpoint.pt")
+        for pat, keep in [("dim_llm_epoch*.pt", ckpt), ("dim_llm_ema_epoch*.pt", ema_ckpt)]:
+            for old in sorted(glob.glob(pat))[:-3]:
+                if old != keep:
+                    os.remove(old)
 
-        
-        # Generation
-        print("\n--- Epoch Word Salad ---")
-        gen_tokens = engine.sample(n_samples=3, steps=32)
-        epoch_salads = []
-        for j in range(len(gen_tokens)):
-            # Use GPT-2 decoder
-            decoded = tokenizer.decode(gen_tokens[j].tolist(), skip_special_tokens=False)
-            print(f"  [Sample {j}] -> {decoded}")
-            epoch_salads.append({"prompt": f"Sample {j}", "response": decoded})
-        
-        stats["salads"].append(epoch_salads)
-        print("------------------------\n")
+        # Early stopping
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(ema_model.state_dict(), "dim_llm_ema_best.pt")
+            print(f"  ** Best val={best_val:.4f} saved -> dim_llm_ema_best.pt")
+        else:
+            patience_counter += 1
+            print(f"  -- No val improvement {patience_counter}/{EARLY_STOP_PAT}")
+            if patience_counter >= EARLY_STOP_PAT:
+                print("Early stopping triggered. Best: dim_llm_ema_best.pt")
+                break
 
-        with open("training_stats.json", "w") as f:
-            json.dump(stats, f)
+        # Word salad
+        print("--- Word Salad ---")
+        samples    = engine.sample(n_samples=3, steps=32, temperature=0.3)
+        salad_list = []
+        for j, g in enumerate(samples):
+            dec = tokenizer.decode(g.tolist(), skip_special_tokens=False)
+            print(f"  [{j}] {dec[:140]}")
+            salad_list.append({"prompt": f"Sample {j}", "response": dec})
+        stats["salads"].append(salad_list)
+        print("------------------")
+
+        with open("training_stats.json", "w") as fj:
+            json.dump(stats, fj)
 
     print("Training complete.")
+
 
 if __name__ == "__main__":
     train()

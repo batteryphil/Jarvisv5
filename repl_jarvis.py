@@ -85,24 +85,37 @@ def run_chat():
             prompt_decoded = tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=False)
             response_segment = full_decoded[len(prompt_decoded):].strip()
             
-            # --- Check for TOOL Use ---
+            # --- Check for TOOL Use (Robust Parser) ---
+            tool_name = None
+            params = {}
             tool_content = parse_xml_tag(response_segment, "tool")
+            
             if tool_content:
                 print(f"   [JARVIS TOOL EXEC] -> {tool_content}")
                 try:
-                    if "{" in tool_content:
-                        name_match = re.search(r'name=\"(.*?)\"', tool_content)
-                        tool_name = name_match.group(1) if name_match else "terminal"
-                        params_match = re.search(r'params=(\{.*?\})', tool_content)
-                        if params_match:
-                            params = json.loads(params_match.group(1))
-                            result = tools_jarvis.call_tool(tool_name, params)
-                        else:
-                            result = {"error": "Could not parse tool parameters."}
-                    else:
-                        result = tools_jarvis.exec_terminal(tool_content)
+                    # Pattern 1: <tool name="terminal" params='{"command": "..."}'>...</tool>
+                    name_match = re.search(r'name=[\"\']([^\"\']+)[\"\']', response_segment)
+                    params_match = re.search(r'params=[\"\']?({.*?})[\"\']?', response_segment, re.DOTALL)
+                    
+                    if name_match:
+                        tool_name = name_match.group(1)
+                    
+                    if params_match:
+                        # Sanitize before JSON parse
+                        raw_params = params_match.group(1).replace("\\'", "'")
+                        params = json.loads(raw_params)
+                    elif tool_content.strip():
+                        # Pattern 2: bare expression like add(45, 12) or nvidia-smi
+                        # Try to call terminal as fallback
+                        tool_name = tool_name or "terminal"
+                        params = {"command": tool_content.strip()}
+                    
+                    result = tools_jarvis.call_tool(tool_name or "terminal", params)
+                    
+                except json.JSONDecodeError:
+                    result = {"error": "Jarvis generated malformed tool params. Skipping."}
                 except Exception as e:
-                    result = {"error": f"Failed: {str(e)}"}
+                    result = {"error": f"Tool execution failed: {str(e)}"}
                 
                 observation = f"\n<observation>{json.dumps(result)}</observation>\n"
                 conversation_history += f"{response_segment}{observation}"
@@ -111,6 +124,7 @@ def run_chat():
                 print(f"Assistant -> {response_segment}")
                 conversation_history += f"{response_segment}\n"
                 thinking_complete = True
+
                 
         if iteration >= 3:
             print("   [Jarvis Memo] Reached maximum reasoning steps.")
