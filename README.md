@@ -3,6 +3,7 @@
 [![Phase](https://img.shields.io/badge/Phase-VI.2-blue)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Recursive%20Mamba-purple)]()
 [![Parameters](https://img.shields.io/badge/Parameters-150M-green)]()
+[![Reasoning Depth](https://img.shields.io/badge/Reasoning%20Depth-N%3D3%20(expanding)-orange)]()
 
 A **150M parameter Parallel Dual-Path Recursive Mamba** language model trained to perform multi-step relational and logical reasoning. This repository contains the full training pipeline, evaluation probes, and data generation scripts needed to reproduce the experiment from scratch.
 
@@ -28,7 +29,8 @@ Input Tokens  ─►  Mamba Layer x8  ─►  Hidden State H₀
 **Key Properties:**
 - `d_model = 1024`, `n_layers = 8`, `vocab = GPT2 tokenizer (~50k)`
 - Parallel dual-path residual: logic and grammar paths merged before each prediction head
-- `N=3` proven optimal for 150M parameter scale — improves context retention, reduces catastrophic forgetting in long sequences
+- `N=3` currently proven optimal for 150M parameter scale — improves context retention, reduces catastrophic forgetting in long sequences
+- **N > 3 is planned** — we are actively debugging gradient sensitivity and surface token over-fitting before scaling the reasoning depth beyond N=3
 
 ---
 
@@ -204,7 +206,29 @@ python monitor_ui.py
 
 ---
 
-## Architecture Citation
+## 🗺️ Roadmap: Pushing Beyond N=3
+
+We have proven that N=3 recursive passes stabilize context memory and eliminate catastrophic forgetting across 900-token windows. The next phase is scaling the reasoning depth above N=3.
+
+**Current Blockers (Being Actively Fixed):**
+
+| Issue | Status | Fix |
+|---|---|---|
+| Gradient sensitivity (`0.37` mean shift) | 🔧 In Progress | Embedding dropout (5%) + gradient noise injection (σ=0.01) now training |
+| Surface token over-fitting ("the lightest metal" loop) | 🔧 In Progress | Regularization from dropout fix above, + adversarial QA data pending |
+| 5-variable reasoning ceiling (N=3 loses to N=1) | 🔬 Researching | Model needs more parameters (`d_model` 1024→2048) or targeted data |
+
+**Planned Expansion:**
+
+```
+Phase VI.2 (Now):   N=3  |  150M params  |  Fix gradient instability
+Phase VI.3 (Next):  N=4  |  150M params  |  Once sensitivity < 0.1
+Phase VII  (Later): N=6  |  300M params  |  d_model 1024 → 2048
+```
+
+The architecture fundamentally supports any N. The bottleneck is ensuring that each additional recursive pass adds *signal* rather than *noise* — which requires the model's internal representations to be regularized enough to survive being re-fed through the SSM blocks repeatedly without exploding.
+
+> **Watching this repo:** Each push corresponds to a measurable experiment result. Check the `Key Findings` section and commit messages for the latest benchmark numbers.
 
 If reproducing or building on this work:
 

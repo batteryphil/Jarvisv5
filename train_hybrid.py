@@ -395,6 +395,15 @@ def train_hybrid():
             
             if (i + 1) % ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                # 🛡️ Protocol v6.6: Gradient Noise Injection (every 50 steps)
+                # Adds σ=0.01 Gaussian noise to all gradients to prevent over-fitting
+                # to sharp surface token patterns (fixes gradient sensitivity: 0.37 → target <0.1)
+                if stats["step"] % 50 == 0:
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.add_(torch.randn_like(p.grad) * 0.01)
+                
                 optimizer.step()
                 optimizer.zero_grad()
                 stats["step"] += 1

@@ -120,6 +120,7 @@ class RecursiveMambaLM(nn.Module):
         super().__init__()
         self.config = config
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
+        self.embed_dropout = nn.Dropout(0.05)  # 🛡️ Protocol v6.6: Embedding dropout to reduce surface token over-sensitivity
         
         self.layers = nn.ModuleList([
             nn.ModuleDict({
@@ -136,6 +137,8 @@ class RecursiveMambaLM(nn.Module):
 
     def forward(self, input_ids):
         x = self.token_embed(input_ids)
+        if self.training:
+            x = self.embed_dropout(x)  # 🛡️ Protocol v6.6: Only drop during training, not inference
         n = self.config.n_reasoning
         
         # Parallel Path Multiplier: 
