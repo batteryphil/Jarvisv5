@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+mamba-ssm
+causal-conv1d
+diffusers
+transformers
+accelerate
+numpy
+scipy
+soundfile
+datasets
