@@ -448,8 +448,16 @@ class RecursiveMamba130M(nn.Module):
                                 
                             step_loss = step_loss + F.cross_entropy(logits_b[:tgt.shape[0]], tgt, ignore_index=tokenizer.eos_token_id) / B
 
+                    # Compute loss for ALL loops — maintains <THINK> token training gradient
                     step_losses.append(step_loss)
-                    step_accs.append(step_acc)
+                    
+                    # FINAL-LOOP GRADUATION PATCH:
+                    # Only grade accuracy on the LAST loop (actual reasoning answer).
+                    # Averaging across all loops (including <THINK> intermediate loops)
+                    # was masking true reasoning accuracy (~70-80%) behind weak Loop 1
+                    # <THINK> performance (~20-30%), locking the curriculum at ~49%.
+                    if step_i == n_steps - 1:
+                        step_accs.append(step_acc)
 
             avg_traj_loss = torch.stack(step_losses).mean() if step_losses else torch.tensor(0.0, device=x.device, requires_grad=True)
             avg_traj_acc = torch.stack(step_accs).mean() if step_accs else torch.tensor(0.0, device=x.device)
