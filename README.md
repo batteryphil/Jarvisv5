@@ -37,7 +37,7 @@ Both models trained on **identical data** (63K chains, 1–5 hops), **identical 
 | Convergence | **~1,500 steps** | ~2,500 steps |
 | Throughput | **~3,000 TPS** | ~1,850 TPS |
 
-> **Key finding**: RLF trains both architectures to ~98% accuracy with O(1) memory per reasoning loop. But the *phase transition* — where the training scaffold becomes redundant at inference — **only emerges in the SSM**. The Mamba2 core internalizes the algorithm into its recurrent state. The Transformer remains permanently dependent on the Prompt Lifeline because it has no recurrent state to absorb the computation.
+> **Key finding**: RLF trains both architectures to ~98% accuracy with **O(1) memory per reasoning loop — zero KV cache accumulation.** But the *phase transition* — where the training scaffold becomes redundant at inference — **only emerges in the SSM.** Critically, Mamba's `d_state` does *not* persist across loops; both models pass information strictly via the residual stream `x`. The divergence is that dense self-attention causes **representation collapse** (over-smoothing), progressively blurring the data payload over repeated iterations. Mamba's selective gating acts as a perfect identity for the payload while surgically routing the pointers — making SSMs a natively superior substrate for autonomous latent test-time compute.
 
 ---
 
