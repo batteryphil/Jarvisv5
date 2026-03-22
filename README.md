@@ -20,29 +20,24 @@ RLF works on both **SSMs** (Mamba2-130M) and **Transformers** (GPT-2-124M). Same
 
 ---
 
-## Results
+## SSM vs Transformer — Head-to-Head
 
-### Mamba2-130M (SSM) — v34, Converged
+Both models trained on **identical data** (63K chains, 1–5 hops), **identical loss**, **identical hyperparameters**. The only variable is SSM vs attention.
 
-| Metric | Result |
-|--------|--------|
-| **Accuracy** | 99.9–100% on 3,355 held-out chains (full 50,279-token vocab) |
-| **Halt Precision** | `<HALT>` fires at p=1.000 at the correct reasoning depth |
-| **Prior Override** | 90.9% correct on counterfactual queries against pretrained priors |
-| **OOD Generalization** | 8-hop chain solved — trained only on 1–5 hops |
-| **Inference Autonomy** | Lifeline can be zeroed at inference with no accuracy drop |
-| **VRAM** | 0.46 GB training / 0.54 GB inference |
+| | **Mamba2-130M** | **GPT-2-124M** |
+|---|:---:|:---:|
+| In-dist accuracy | **99.9%** | 98.5% |
+| Halt precision | **p=1.000** | p=0.999 |
+| 6-hop OOD | **✅** | ❌ |
+| 8-hop OOD | **✅** | ❌ |
+| 10-hop OOD | **✅** | ❌ |
+| Lifeline removable at inference | **✅** | ❌ |
+| VRAM | **0.46 GB** | 1.46 GB |
+| KV cache per loop | **O(1)** | **O(1)** |
+| Convergence | **~1,500 steps** | ~2,500 steps |
+| Throughput | **~3,000 TPS** | ~1,850 TPS |
 
-### GPT-2-124M (Transformer) — Training In Progress
-
-| Metric | Step 900 |
-|--------|----------|
-| **AllLoop Accuracy** | 80.8% ↑ |
-| **Answer Accuracy** | 77.7% ↑ |
-| **Halt Accuracy** | 96.9% |
-| **VRAM** | 1.46 GB |
-
-Same training data, same loss, same hyperparameters. Zero Mamba code. Still climbing.
+> **Key finding**: RLF trains both architectures to ~98% accuracy with O(1) memory per reasoning loop. But the *phase transition* — where the training scaffold becomes redundant at inference — **only emerges in the SSM**. The Mamba2 core internalizes the algorithm into its recurrent state. The Transformer remains permanently dependent on the Prompt Lifeline because it has no recurrent state to absorb the computation.
 
 ---
 
